@@ -121,11 +121,8 @@ def jedi_query(file_path, line, col, operation):
             for d in script.goto_definitions(line, col)
         ],
         "symbols": lambda: [
-            {"name": s.name, "line": s.line, "column": s.column, "type": s.type}
-            for s in script.get_syntax_errors() or []
-        ] + [
-            {"name": "", "line": 0, "column": 0, "type": "syntax_error"}
-            for _ in []  # empty placeholder
+            {"name": n.name, "line": n.line, "column": n.column, "type": n.type}
+            for n in script.get_names(all_scopes=True, definitions=True)
         ],
         "completions": lambda: [
             {"name": c.name, "type": c.type, "description": c.description, "docstring": c.docstring()[:300] if c.docstring() else ""}

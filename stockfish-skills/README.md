@@ -29,3 +29,14 @@ Alle Skills wurden getestet vor Commit.
 Siehe Task T-066, T-067, T-068 im Supabase Projekt STKF.
 
 Stand: 01.09.2026
+
+---
+
+## Architecture
+
+Siehe **[ARCHITECTURE.md](ARCHITECTURE.md)** — vollständige Systemdokumentation mit:
+- Fork-Struktur, Komponenten, Datenfluss
+- Memory-System, Dreaming, Embeddings
+- Config, Cron-Jobs, Sicherheit
+- Live-Status via `stockfish-status.py`
+- Roadmap (Nächste Schritte)

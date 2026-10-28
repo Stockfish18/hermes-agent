@@ -4,11 +4,21 @@
  * async entry points with a resolved git binary.
  */
 
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+
+import { parse as parseYaml } from 'yaml'
+
+import {
+  PACKAGE_MARKER,
+  publishDesktopTree,
+  withDesktopPluginsRoot,
+  writeDesktopHalfMarker
+} from './desktop-plugins-root'
+import { execGit, hiddenGitSpawnSpec } from './no-console-git'
 
 const GITHUB_BROWSER_SEGMENTS = new Set(['tree', 'blob', 'commit'])
 
@@ -191,13 +201,46 @@ export function findDesktopEntry(pluginRoot: string): { entryFile: string; sourc
   return null
 }
 
-export async function detectPluginComponents(pluginRoot: string): Promise<PluginComponentDetection> {
-  const hasYaml =
-    pathExistsSync(path.join(pluginRoot, 'plugin.yaml')) || pathExistsSync(path.join(pluginRoot, 'plugin.yml'))
+/** Files beside a `plugin.yaml` that the agent side loads: a `register(ctx)` package, or a dashboard
+ *  tab/backend (`dashboard/manifest.json`, often with a `plugin_api.py`) the gateway mounts. */
+const AGENT_PAYLOAD_FILES = ['__init__.py', path.join('dashboard', 'manifest.json')]
 
-  const hasInit = pathExistsSync(path.join(pluginRoot, '__init__.py'))
+/** Whether a `plugin.yaml` folder has something for the agent side to load. A manifest alone is not
+ *  enough: desktop-only plugins ship one beside `desktop/plugin.js` for metadata. Same rule as the
+ *  gateway's `_yaml_ships_agent_payload` (hermes_cli/plugins_cmd_inspect.py); the shared cases live in
+ *  tests/fixtures/plugin_component_detection.json. */
+async function yamlShipsAgentPayload(pluginRoot: string, yamlPath: string): Promise<boolean> {
+  if (AGENT_PAYLOAD_FILES.some(rel => pathExistsSync(path.join(pluginRoot, rel)))) {
+    return true
+  }
+
+  // The loader's manifest-only language pack: declared locales plus the folder that holds them.
+  if (!(await pathIsDirectory(path.join(pluginRoot, 'locales')))) {
+    return false
+  }
+
+  try {
+    const manifest: unknown = parseYaml(await fsp.readFile(yamlPath, 'utf8'))
+    const locales = (manifest as { provides_locales?: unknown } | null)?.provides_locales
+
+    // Python truthiness, as the gateway judges it: an empty list or mapping declares nothing.
+    return locales !== null && typeof locales === 'object' ? Object.keys(locales).length > 0 : Boolean(locales)
+  } catch {
+    return false
+  }
+}
+
+export async function detectPluginComponents(pluginRoot: string): Promise<PluginComponentDetection> {
+  const yamlPath = ['plugin.yaml', 'plugin.yml']
+    .map(name => path.join(pluginRoot, name))
+    .find(candidate => pathExistsSync(candidate))
+
+  const hasYaml = yamlPath !== undefined
   const hasPortable = pathExistsSync(path.join(pluginRoot, 'plugin.json'))
-  const agent = (hasYaml && hasInit) || hasPortable
+  // `__init__.py` is one agent payload, not a requirement: a manifest-only package with a
+  // `dashboard/plugin_api.py` backend must install its agent half, or its desktop half lands alone and
+  // every `ctx.rest` call 404s.
+  const agent = (hasYaml && (await yamlShipsAgentPayload(pluginRoot, yamlPath))) || hasPortable
 
   const desktopEntry = findDesktopEntry(pluginRoot)
   const desktop = desktopEntry !== null
@@ -209,10 +252,6 @@ export async function detectPluginComponents(pluginRoot: string): Promise<Plugin
 
     if (hasYaml) {
       try {
-        const yamlPath = pathExistsSync(path.join(pluginRoot, 'plugin.yaml'))
-          ? path.join(pluginRoot, 'plugin.yaml')
-          : path.join(pluginRoot, 'plugin.yml')
-
         const text = await fsp.readFile(yamlPath, 'utf8')
         const match = text.match(/^name:\s*['"]?([^'"\n]+)['"]?\s*$/m)
 
@@ -260,21 +299,25 @@ function noninteractiveGitEnv(): NodeJS.ProcessEnv {
   }
 }
 
+// Matches the backend's default `plugins.clone_timeout_seconds`.
+const GIT_TIMEOUT_MS = 300_000
+
 function runGit(gitBin: string, args: string[], cwd?: string): Promise<{ code: number; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(gitBin, args, {
+    const spec = hiddenGitSpawnSpec(gitBin, args, {
       cwd,
       env: noninteractiveGitEnv(),
-      stdio: ['ignore', 'ignore', 'pipe'],
-      windowsHide: true
+      stdio: ['ignore', 'ignore', 'pipe']
     })
+
+    const child = spawn(spec.command, spec.args, spec.options)
 
     let stderr = ''
 
     const timer = setTimeout(() => {
       child.kill('SIGKILL')
-      reject(new Error('Git clone timed out after 60 seconds.'))
-    }, 60_000)
+      reject(new Error(`Git ${args[0]} timed out after ${GIT_TIMEOUT_MS / 1000} seconds.`))
+    }, GIT_TIMEOUT_MS)
 
     child.stderr?.on('data', chunk => {
       stderr += String(chunk)
@@ -292,15 +335,37 @@ function runGit(gitBin: string, args: string[], cwd?: string): Promise<{ code: n
   })
 }
 
-async function cloneToTemp(gitBin: string, gitUrl: string): Promise<string> {
+async function runGitOrThrow(gitBin: string, args: string[], cwd?: string): Promise<void> {
+  const { code, stderr } = await runGit(gitBin, args, cwd)
+
+  if (code !== 0) {
+    throw new Error(`Git ${args[0]} failed:\n${stderr.trim()}`)
+  }
+}
+
+/** Sparse-check-out only `subdir` via the classic pattern file, which older Git clients understand. */
+function sparseCheckoutPattern(subdir: string): string {
+  return `/${subdir.replace(/^\/+|\/+$/g, '').replace(/([\\*?[])/g, '\\$1')}/\n`
+}
+
+// A subdirectory install is a blobless clone with a sparse checkout of that folder: a plugin inside
+// a monorepo (Hindsight: 170 MB at depth 1, 2 MB for its plugin folder) otherwise downloads every
+// file in the repository and times out on slow connections.
+async function cloneToTemp(gitBin: string, gitUrl: string, subdir: string | null): Promise<string> {
   const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'hermes-plugin-'))
 
   try {
-    const { code, stderr } = await runGit(gitBin, ['clone', '--depth', '1', gitUrl, tmpRoot])
+    if (!subdir) {
+      await runGitOrThrow(gitBin, ['clone', '--depth', '1', gitUrl, tmpRoot])
 
-    if (code !== 0) {
-      throw new Error(`Git clone failed:\n${stderr.trim()}`)
+      return tmpRoot
     }
+
+    await runGitOrThrow(gitBin, ['clone', '--depth', '1', '--filter=blob:none', '--no-checkout', gitUrl, tmpRoot])
+    await runGitOrThrow(gitBin, ['config', 'core.sparseCheckout', 'true'], tmpRoot)
+    await fsp.mkdir(path.join(tmpRoot, '.git', 'info'), { recursive: true })
+    await fsp.writeFile(path.join(tmpRoot, '.git', 'info', 'sparse-checkout'), sparseCheckoutPattern(subdir), 'utf8')
+    await runGitOrThrow(gitBin, ['checkout', 'HEAD'], tmpRoot)
 
     return tmpRoot
   } catch (err) {
@@ -338,7 +403,7 @@ export async function probePluginRepo(gitBin: string, identifier: string): Promi
   try {
     const { gitUrl, subdir } = resolvePluginGitUrl(identifier)
     const { warnings, insecure } = insecureSchemeWarnings(gitUrl)
-    const cloneRoot = await cloneToTemp(gitBin, gitUrl)
+    const cloneRoot = await cloneToTemp(gitBin, gitUrl, subdir)
 
     try {
       const pluginRoot = await resolvePluginRoot(cloneRoot, subdir)
@@ -380,11 +445,6 @@ export async function probePluginRepo(gitBin: string, identifier: string): Promi
   }
 }
 
-async function copyDesktopTree(sourceDir: string, targetDir: string): Promise<void> {
-  await fsp.mkdir(path.dirname(targetDir), { recursive: true })
-  await fsp.cp(sourceDir, targetDir, { recursive: true, force: true })
-}
-
 export async function installDesktopPluginFromGit(
   gitBin: string,
   identifier: string,
@@ -393,7 +453,7 @@ export async function installDesktopPluginFromGit(
 ): Promise<DesktopPluginInstallResult> {
   try {
     const { gitUrl, subdir } = resolvePluginGitUrl(identifier)
-    const cloneRoot = await cloneToTemp(gitBin, gitUrl)
+    const cloneRoot = await cloneToTemp(gitBin, gitUrl, subdir)
 
     try {
       const pluginRoot = await resolvePluginRoot(cloneRoot, subdir)
@@ -406,28 +466,67 @@ export async function installDesktopPluginFromGit(
       const sourceDir =
         detected.desktopSourceSubdir === '.' ? pluginRoot : path.join(pluginRoot, detected.desktopSourceSubdir)
 
-      const pluginName = desktopPluginFolderName(gitUrl, subdir)
+      // A repo carrying BOTH halves is one package: land its desktop half under
+      // the AGENT package name, so the copy this app makes and the one
+      // `reconcileUnifiedDesktopHalves` would make are the same folder (#100412)
+      // and the Plugins page pairs them into one row. A desktop-only repo keeps
+      // the git-derived folder name and stays a standalone plugin.
+      const packageName = detected.agent ? (detected.agentName ?? desktopPluginFolderName(gitUrl, subdir)) : null
+      const pluginName = packageName ?? desktopPluginFolderName(gitUrl, subdir)
       const targetDir = path.join(desktopPluginsRoot, pluginName)
       const targetPlugin = path.join(targetDir, 'plugin.js')
 
-      if ((await pathIsDirectory(targetDir)) || (await pathIsFile(targetPlugin))) {
-        if (!force) {
-          return {
-            ok: false,
-            error: `Desktop plugin '${pluginName}' already exists. Enable force reinstall to replace it.`
+      // Under the root's writer lock: the exists check and the publish must not
+      // interleave with a reconcile pass copying the same package folder.
+      return await withDesktopPluginsRoot<DesktopPluginInstallResult>(desktopPluginsRoot, async () => {
+        if ((await pathIsDirectory(targetDir)) || (await pathIsFile(targetPlugin))) {
+          if (!force) {
+            return {
+              ok: false,
+              error: `Desktop plugin '${pluginName}' already exists. Enable force reinstall to replace it.`
+            }
           }
+
+          await fsp.rm(targetDir, { recursive: true, force: true })
         }
 
-        await fsp.rm(targetDir, { recursive: true, force: true })
-      }
+        // Staged copy + rename: a failed copy must not leave an empty `targetDir`
+        // that turns every retry into "already exists. Enable force reinstall".
+        // The half of a unified package is stamped with the package marker as
+        // part of that publication — without it the Plugins page cannot tell this
+        // copy belongs to the agent row (it sits on "copying…" forever) and the
+        // half loads default-enabled instead of opt-in.
+        await publishDesktopTree(sourceDir, targetDir, async staged => {
+          if (!packageName) {
+            // A desktop-only repo is a standalone plugin. A package marker it
+            // ships would name another package's agent half as its own (pairing
+            // it on the Plugins page and letting it render that package's tool
+            // media), so only this installer or the reconcile pass writes one.
+            await fsp.rm(path.join(staged, PACKAGE_MARKER), { force: true })
 
-      await copyDesktopTree(sourceDir, targetDir)
+            return
+          }
 
-      if (!(await pathIsFile(targetPlugin))) {
-        return { ok: false, error: `Install completed but ${targetPlugin} is missing.` }
-      }
+          await writeDesktopHalfMarker(staged, {
+            package: packageName,
+            repo: gitUrl,
+            // The published folder, not the temp clone. The clone is deleted
+            // below; a source that disappears is ghost-pruned on the next
+            // reconcile when no local `plugins/<name>/desktop` exists to
+            // re-copy from (remote backend, or Desktop UI only). A later pass
+            // that does find the agent package still replaces this copy,
+            // because this path is not that package's `desktop/` dir.
+            source: targetDir,
+            sourceMtimeMs: (await fsp.stat(path.join(staged, 'plugin.js'))).mtimeMs
+          })
+        })
 
-      return { ok: true, pluginName, path: targetDir }
+        if (!(await pathIsFile(targetPlugin))) {
+          return { ok: false, error: `Install completed but ${targetPlugin} is missing.` }
+        }
+
+        return { ok: true, pluginName, path: targetDir }
+      })
     } finally {
       await fsp.rm(cloneRoot, { recursive: true, force: true }).catch(() => undefined)
     }
@@ -438,9 +537,8 @@ export async function installDesktopPluginFromGit(
 
 /** Resolve git binary via execFile which path on unix; caller passes Windows-resolved path. */
 export function runGitVersion(gitBin: string): Promise<boolean> {
-  return new Promise(resolve => {
-    execFile(gitBin, ['--version'], { windowsHide: true, timeout: 5_000 }, err => {
-      resolve(!err)
-    })
-  })
+  return execGit(gitBin, ['--version'], { timeoutMs: 5_000 }).then(
+    result => result.code === 0,
+    () => false
+  )
 }
